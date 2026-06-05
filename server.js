@@ -2,45 +2,45 @@
  * Voice Intelligence — Speech-to-Text backend (thin proxy).
  *
  * One job: receive an audio blob from the Salesforce LWC, forward it to
- * Groq Whisper (multipart — trivial and 100% reliable in Node), return
- * { text }. No database, no state. Free to host (Render free tier / etc.).
+ * OpenAI's hosted transcription model, return { text }. No database, no state.
+ * Free to host (Render free tier / AWS / Azure App Service / etc.).
  *
  * Env vars:
- *   GROQ_API_KEY   (required)  your existing free Groq key (gsk_...)
- *   GROQ_MODEL     (optional)  default: whisper-large-v3-turbo
- *   ALLOWED_ORIGIN (optional)  CSV of allowed origins; default: reflect any
- *   PORT           (optional)  Render sets this automatically
+ *   OPENAI_API_KEY    (required)  your OpenAI API key (sk-...)
+ *   OPENAI_STT_MODEL  (optional)  default: gpt-4o-transcribe
+ *                                 alternatives: gpt-4o-mini-transcribe, whisper-1
+ *   ALLOWED_ORIGIN    (optional)  CSV of allowed origins; default: reflect any
+ *   INGEST_TOKEN      (optional)  shared secret expected as x-ingest-token header
+ *   PORT              (optional)  the host (Render / Azure) sets this automatically
  */
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'whisper-large-v3-turbo';
-const PORT = process.env.PORT || 3000;
-const ALLOWED = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
-// Optional shared secret. If set, server-side (Apex) callers must send it as
-// the x-ingest-token header. Leave unset for the simplest possible setup.
-const INGEST_TOKEN = process.env.INGEST_TOKEN || '';
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const OPENAI_STT_MODEL = process.env.OPENAI_STT_MODEL || 'gpt-4o-transcribe';
+const PORT             = process.env.PORT || 3000;
+const ALLOWED          = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+const INGEST_TOKEN     = process.env.INGEST_TOKEN || '';
 
 const app = Fastify({ logger: true, bodyLimit: 35 * 1024 * 1024 });
 
-// Shared: send a Buffer of audio to Groq Whisper, return transcript text.
-async function groqTranscribe(buf, mimetype, filename, lang) {
+// Shared: send a Buffer of audio to OpenAI transcription, return transcript text.
+async function openaiTranscribe(buf, mimetype, filename, lang) {
   const form = new FormData();
   form.append('file', new Blob([buf], { type: mimetype || 'audio/webm' }), filename || 'audio.webm');
-  form.append('model', GROQ_MODEL);
+  form.append('model', OPENAI_STT_MODEL);
   form.append('response_format', 'json');
   if (lang) form.append('language', lang);
 
-  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+  const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
     body: form
   });
   const bodyText = await r.text();
   if (!r.ok) {
-    const err = new Error(`Groq ${r.status}: ${bodyText.slice(0, 600)}`);
+    const err = new Error(`OpenAI ${r.status}: ${bodyText.slice(0, 600)}`);
     err.status = r.status;
     throw err;
   }
@@ -52,12 +52,12 @@ await app.register(cors, {
   // Reflect the request origin unless an explicit allow-list is configured.
   origin: ALLOWED.length ? ALLOWED : true,
   methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-language']
+  allowedHeaders: ['Content-Type', 'x-language', 'x-ingest-token']
 });
 await app.register(multipart, { limits: { fileSize: 30 * 1024 * 1024 } });
 
-// Uptime ping target (keeps the free dyno warm — point a free cron at this).
-app.get('/health', async () => ({ ok: true, ts: Date.now() }));
+// Uptime ping target (keeps the dyno warm; also lets the admin check the service is alive).
+app.get('/health', async () => ({ ok: true, model: OPENAI_STT_MODEL, ts: Date.now() }));
 
 /**
  * Server-to-server endpoint. Salesforce Apex (orchestrator) calls this via a
@@ -70,8 +70,8 @@ app.get('/health', async () => ({ ok: true, ts: Date.now() }));
  *   200:     { "text": "the transcript" }
  */
 app.post('/transcribe-json', async (req, reply) => {
-  if (!GROQ_API_KEY) {
-    return reply.code(500).send({ error: 'Server misconfigured: GROQ_API_KEY not set' });
+  if (!OPENAI_API_KEY) {
+    return reply.code(500).send({ error: 'Server misconfigured: OPENAI_API_KEY not set' });
   }
   if (INGEST_TOKEN && req.headers['x-ingest-token'] !== INGEST_TOKEN) {
     return reply.code(401).send({ error: 'Invalid or missing x-ingest-token' });
@@ -99,7 +99,7 @@ app.post('/transcribe-json', async (req, reply) => {
     fileName.endsWith('.ogg') ? 'audio/ogg' : 'audio/webm';
 
   try {
-    const text = await groqTranscribe(buf, mime, fileName, lang2);
+    const text = await openaiTranscribe(buf, mime, fileName, lang2);
     return reply.send({ text });
   } catch (e) {
     req.log.error(e);
@@ -108,9 +108,10 @@ app.post('/transcribe-json', async (req, reply) => {
   }
 });
 
+// Legacy multipart endpoint kept for completeness; not used in the live path.
 app.post('/transcribe', async (req, reply) => {
-  if (!GROQ_API_KEY) {
-    return reply.code(500).send({ error: 'Server misconfigured: GROQ_API_KEY not set' });
+  if (!OPENAI_API_KEY) {
+    return reply.code(500).send({ error: 'Server misconfigured: OPENAI_API_KEY not set' });
   }
 
   const data = await req.file();              // multipart field name: "file"
@@ -126,7 +127,7 @@ app.post('/transcribe', async (req, reply) => {
   const lang = langRaw.includes('-') ? langRaw.split('-')[0] : langRaw;
 
   try {
-    const text = await groqTranscribe(buf, data.mimetype, data.filename, lang);
+    const text = await openaiTranscribe(buf, data.mimetype, data.filename, lang);
     return reply.send({ text });
   } catch (e) {
     req.log.error(e);
@@ -136,5 +137,5 @@ app.post('/transcribe', async (req, reply) => {
 });
 
 app.listen({ port: PORT, host: '0.0.0.0' })
-  .then(() => app.log.info(`STT backend listening on :${PORT}`))
+  .then(() => app.log.info(`STT backend listening on :${PORT} (model=${OPENAI_STT_MODEL})`))
   .catch((err) => { app.log.error(err); process.exit(1); });
